@@ -1227,3 +1227,109 @@ def natural_layer_sweep():
         for r in rows: f.write(json.dumps(r) + "\n")
     nbvol.commit()
     print(f"[nls] DONE {len(rows)} {time.time()-t0:.0f}s", flush=True)
+
+
+NAT_LAYERS = (25, 26)   # two-layer natural labels: agreement required
+
+
+def _two_layer_label(a, b, pres=NAT_PRESENT, absn=NAT_ABSENT):
+    if a <= pres and b <= pres: return "present"
+    if a >= absn and b >= absn: return "absent"
+    return "discard"
+
+
+@app.function(image=image, gpu="L4", volumes={MOUNT: weights, NB: nbvol}, timeout=2 * 3600)
+def labels_neutral_multi():
+    """Injected-stratum labels at L24, L25, L26 (same design as labels_neutral) so the
+    mentor can choose between L24-only and a uniform two-layer scheme across strata."""
+    import json, time
+    import torch
+    P = Pipeline(BASE_A, LENS, ELICIT_CONTENT)
+    model = P.model
+    LAYERS = (24, 25, 26)
+    vdir = {l: {w: (lambda v: v / v.norm())(P.J[l].float().T @ (P.G.float() * P.W_U[c].float())) for w, c in P.CID.items()} for l in LAYERS}
+    def lens_rank(h, l, cid):
+        lg = P.W_U @ P.NORM(P.J[l].float() @ h).to(P.W_U.dtype); return (lg > lg[cid]).sum().item()
+    rows, t0 = [], time.time()
+    with torch.no_grad():
+        for pi, passage in enumerate(PASSAGES):
+            ids, span, _ = P.build_trial(passage, "PRESENT: yes\nCONCEPT:")
+            o_c = model(input_ids=ids, output_hidden_states=True)
+            hc = {l: o_c.hidden_states[l + 1][0, -1].float() for l in LAYERS}
+            lgc = o_c.logits[0, -1].float()
+            for name, cid in P.CID.items():
+                rows.append(dict(concept=name, category=P.CAT[name], passage=pi, gamma=0.0,
+                                 rank_c=(lgc > lgc[cid]).sum().item(),
+                                 lens={str(l): lens_rank(hc[l], l, cid) for l in LAYERS},
+                                 proj_clean={str(l): torch.dot(hc[l], vdir[l][name]).item() for l in LAYERS}))
+                for g in (0.2, 0.4):
+                    P.clear_hooks(); P.inject(cid, g, span)
+                    o = model(input_ids=ids, output_hidden_states=True); P.clear_hooks()
+                    lg = o.logits[0, -1].float()
+                    rows.append(dict(concept=name, category=P.CAT[name], passage=pi, gamma=g,
+                                     rank_c=(lg > lg[cid]).sum().item(),
+                                     lens={str(l): lens_rank(o.hidden_states[l + 1][0, -1].float(), l, cid) for l in LAYERS},
+                                     proj_clean={str(l): torch.dot(hc[l], vdir[l][name]).item() for l in LAYERS}))
+            print(f"  [labm] passage {pi+1:2d}/20 {time.time()-t0:4.0f}s", flush=True)
+    with open(f"{NB}/labels_neutral_multi.jsonl", "w") as f:
+        for r in rows: f.write(json.dumps(r) + "\n")
+    nbvol.commit(); print(f"[labm] DONE {len(rows)}", flush=True)
+
+
+@app.function(image=image, gpu="L4", volumes={MOUNT: weights, NB: nbvol}, timeout=2 * 3600)
+def importance_pilot_2layer():
+    """H5 validation on the two-layer natural present set (L25 and L26 agree, <=100).
+    Clean-value rank-one ablation of v_c at the answer slot at L25 and at L26 separately.
+    Clean projection per (concept, layer) = median over the 20 Phase 1 passages, computed here."""
+    import json, time
+    import numpy as np
+    import torch
+    P = Pipeline(BASE_A, LENS, ELICIT_CONTENT)
+    model = P.model
+    sweep = [json.loads(l) for l in open(f"{NB}/natural_layer_sweep.jsonl")]
+    from natural_pool import NATURAL_POOL
+    present = [r for r in sweep if _two_layer_label(r["jlens"]["25"], r["jlens"]["26"]) == "present"]
+    vdir = {l: {w: (lambda v: v / v.norm())(P.J[l].float().T @ (P.G.float() * P.W_U[c].float())) for w, c in P.CID.items()} for l in NAT_LAYERS}
+    # clean projections at L25/L26 from the 20 neutral passages
+    cp = {l: {w: [] for w in P.CID} for l in NAT_LAYERS}
+    with torch.no_grad():
+        for passage in PASSAGES:
+            ids, _, _ = P.build_trial(passage, "PRESENT: yes\nCONCEPT:")
+            o = model(input_ids=ids, output_hidden_states=True)
+            for l in NAT_LAYERS:
+                h = o.hidden_states[l + 1][0, -1].float()
+                for w in P.CID: cp[l][w].append(torch.dot(h, vdir[l][w]).item())
+    cp = {l: {w: float(np.median(v)) for w, v in d.items()} for l, d in cp.items()}
+    class Edit:
+        def __init__(self): self.h = []
+        def install(self, l, fn):
+            self.remove()
+            def hook(mod, args):
+                x = args[0].clone(); x[:, -1, :] = fn(x[:, -1, :].float()).to(x.dtype); return (x,) + args[1:]
+            self.h.append(model.model.layers[l + 1].register_forward_pre_hook(hook))
+        def remove(self):
+            for k in self.h: k.remove()
+            self.h = []
+    ed = Edit()
+    score = lambda lg, cid: ((lg > lg[cid]).sum().item(), torch.log_softmax(lg, -1)[cid].item())
+    rows, t0 = [], time.time()
+    with torch.no_grad():
+        for i, r in enumerate(present):
+            name, cid = r["concept"], P.CID[r["concept"]]
+            passage = NATURAL_POOL[name][r["desc_idx"]]
+            ids, _, _ = P.build_trial(passage, "PRESENT: yes\nCONCEPT:")
+            r0, lp0 = score(model(input_ids=ids).logits[0, -1].float(), cid)
+            out = dict(concept=name, category=r["category"], desc_idx=r["desc_idx"], lens_L25=r["jlens"]["25"], lens_L26=r["jlens"]["26"],
+                       rank_base=r0, logp_base=lp0, named_base=r0 < 5)
+            for l in NAT_LAYERS:
+                v, pc = vdir[l][name], cp[l][name]
+                ed.install(l, lambda h, v=v, pc=pc: h - ((h @ v) - pc).unsqueeze(-1) * v)
+                rk, lp = score(model(input_ids=ids).logits[0, -1].float(), cid); ed.remove()
+                out[f"L{l}"] = {"rank": rk, "logp": lp, "dlogp": lp - lp0, "clean_proj": pc}
+            rows.append(out)
+    with open(f"{NB}/importance_2layer.jsonl", "w") as f:
+        for r in rows: f.write(json.dumps(r) + "\n")
+    nbvol.commit()
+    for l in NAT_LAYERS:
+        d = np.array([r[f"L{l}"]["dlogp"] for r in rows]); print(f"[imp2] L{l}: n={len(rows)} dlogp median {np.median(d):+.2f} sd {d.std():.2f}", flush=True)
+    print(f"[imp2] DONE {len(rows)}", flush=True)
