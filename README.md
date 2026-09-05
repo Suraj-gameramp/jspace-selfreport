@@ -69,3 +69,14 @@ modal run code/workshop_runs.py::controls   # re-run a control arm (needs the vo
 
 The Modal scripts expect the Qwen3 weights and the lens on a volume mounted at
 `/models`; see the paths at the top of `workshop_runs.py`.
+
+## Added after submission: causal follow-ups
+
+| file | rows | what |
+|---|---|---|
+| `answer_scan.jsonl` | 250 | gamma 0.4, lens rank at all 35 layers read at BOTH the last user-turn token (`at_user`) and the answer slot (`at_answer`), same forward pass; `logit_answer` is the plain logit lens at the answer slot |
+| `patch_sweep.jsonl` | 500 | sufficiency: source (injected) residual at one (layer, position) patched into a clean run; `answer`, `summary`, `block` map lens-layer to rank of c afterward; `ctrl_clean_to_clean` is the null patch |
+| `necessity_sweep.jsonl` | 500 | necessity: clean residual patched INTO the injected run at (layer, position); `ablate_answer`, `ablate_user_span` |
+| `last_two.json` | | `im_end_scan`: rank of `<\|im_end\|>` at the summary token by layer (50 trials); `jrandom_02`: J-space random control at gamma 0.2 (500) |
+
+Figures 7 (answer-slot scan) and 8 (patching) and their scripts are in `figures/` and `code/`. `analyze_patch.py` and `analyze_necessity.py` reproduce every number quoted from the patching runs.

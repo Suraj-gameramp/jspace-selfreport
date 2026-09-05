@@ -511,3 +511,314 @@ def model_b():
 @app.local_entrypoint()
 def main():
     gamma_ext.remote()
+
+
+@app.function(image=image, gpu="L4", volumes={MOUNT: weights, NB: nbvol}, timeout=2 * 3600)
+def answer_scan():
+    """Where does the NAME come from?
+
+    The main experiment reads ground truth at the last user-turn token, a summary
+    position. But the model emits the concept name ~25 tokens later, at the answer
+    slot, which attends to every user token directly. If the concept is readable in
+    the residual under the answer slot but not at the summary token, then the report
+    is reading a state and we were measuring at the wrong place.
+
+    One forward pass per trial, lens read at BOTH positions at every layer, so the
+    two are directly comparable on identical activations. gamma=0.4, 5 passages.
+    Sanity check: at the last layer the answer-position lens should approximately
+    reproduce rank_c, since that residual is what produces the next token.
+    """
+    import json, time
+    import torch
+    P = Pipeline(BASE_A, LENS, ELICIT2)
+    rows, t0 = [], time.time()
+    with torch.no_grad():
+        for i, name in enumerate(P.CONCEPTS):
+            cid = P.CID[name]
+            for pi in range(5):
+                # prefill up to the naming slot: the last position IS where the name is produced
+                ids, span, read_pos = P.build_trial(PASSAGES[pi], "INJECTED: yes\nCONCEPT:")
+                P.clear_hooks()
+                P.inject(cid, 0.4, span)
+                o = P.model(input_ids=ids, output_hidden_states=True)
+                P.clear_hooks()
+                lg = o.logits[0, -1].float()
+                rank_c = (lg > lg[cid]).sum().item()
+                at_user, at_answer = [], []
+                for l in range(len(P.J)):
+                    Jl = P.J[l].float()
+                    hu = o.hidden_states[l + 1][0, read_pos].float()
+                    ha = o.hidden_states[l + 1][0, -1].float()
+                    lu = P.W_U @ P.NORM(Jl @ hu).to(P.W_U.dtype)
+                    la = P.W_U @ P.NORM(Jl @ ha).to(P.W_U.dtype)
+                    at_user.append((lu > lu[cid]).sum().item())
+                    at_answer.append((la > la[cid]).sum().item())
+                # logit lens at the answer position too: does the J-lens add anything here?
+                logit_answer = []
+                for l in range(len(P.J)):
+                    ha = o.hidden_states[l + 1][0, -1].float()
+                    ll = P.W_U @ P.NORM(ha).to(P.W_U.dtype)
+                    logit_answer.append((ll > ll[cid]).sum().item())
+                rows.append(dict(concept=name, category=P.CAT[name], passage=pi, gamma=0.4,
+                                 rank_c=rank_c, at_user=at_user, at_answer=at_answer,
+                                 logit_answer=logit_answer,
+                                 top5=[P.tok.decode([k]) for k in lg.topk(5).indices.tolist()]))
+            print(f"  [ans] {i+1:2d}/50 {name:10s} {time.time()-t0:5.0f}s", flush=True)
+    with open(f"{NB}/answer_scan.jsonl", "w") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    nbvol.commit()
+    print(f"[ans] DONE {len(rows)} rows", flush=True)
+
+
+@app.function(image=image, gpu="L4", volumes={MOUNT: weights, NB: nbvol}, timeout=3600)
+def last_two():
+    """Two cheap follow-ups for the write-up.
+
+    (1) At the summary token (last user-turn token), does <|im_end|> rise into the top
+        ranks after layer 22? If yes, the fading of the concept there is the position
+        converging on its own next token, which is the interpretation the draft uses.
+    (2) J-space random control at gamma 0.2, so the disturbance-detector claim has a
+        second dose. 500 trials, same design as the gamma 0.4 run."""
+    import json, random, time
+    import torch
+    P = Pipeline(BASE_A, LENS, ELICIT2)
+    im_end = P.IM_END
+    out = {"im_end_scan": [], "jrandom_02": []}
+    t0 = time.time()
+    with torch.no_grad():
+        # (1) im_end rank by layer at the summary token, 10 concepts x 5 passages, gamma 0.4
+        for name in ["spider", "France", "purple", "boredom", "bread", "whale", "Egypt",
+                     "navy", "guilt", "chocolate"]:
+            cid = P.CID[name]
+            for pi in range(5):
+                ids, span, read_pos = P.build_trial(PASSAGES[pi], "INJECTED:")
+                P.clear_hooks(); P.inject(cid, 0.4, span)
+                hs = P.model(input_ids=ids, output_hidden_states=True).hidden_states
+                P.clear_hooks()
+                ranks_end, ranks_c = [], []
+                for l in range(len(P.J)):
+                    h = hs[l + 1][0, read_pos].float()
+                    lg = P.W_U @ P.NORM(P.J[l].float() @ h).to(P.W_U.dtype)
+                    ranks_end.append((lg > lg[im_end]).sum().item())
+                    ranks_c.append((lg > lg[cid]).sum().item())
+                out["im_end_scan"].append(dict(concept=name, passage=pi,
+                                               im_end_rank=ranks_end, concept_rank=ranks_c))
+        print(f"  [last2] im_end scan done {time.time()-t0:.0f}s", flush=True)
+
+        # (2) J-space random at gamma 0.2
+        battery_ids = set(P.CID.values())
+        def rand_token(seed):
+            rng = random.Random(seed)
+            while True:
+                t = rng.randrange(2000, 150000)
+                s = P.tok.decode([t])
+                if t not in battery_ids and s.startswith(" ") and s.strip().isalpha() and len(s.strip()) > 2:
+                    return t
+        for i, name in enumerate(P.CONCEPTS):
+            cid = P.CID[name]
+            for pi in range(10):
+                vec = rand_token(i * 1000 + pi)
+                ids, span, read_pos = P.build_trial(PASSAGES[pi], "INJECTED:")
+                P.clear_hooks()
+                for l in INJECT_LAYERS:
+                    v = P.concept_vec(vec, l - 1)
+                    P.HOOKS.append(P.model.model.layers[l].register_forward_pre_hook(
+                        P.make_hook(v, 0.2 * P.NORMS[l], span)))
+                o = P.model(input_ids=ids, output_hidden_states=True)
+                P.clear_hooks()
+                ans = P.answer(o.logits[0, -1].float(), ("yes", "no"))
+                out["jrandom_02"].append(dict(concept=name, category=P.CAT[name], passage=pi,
+                                              gamma=0.2, vec_token=P.tok.decode([vec]), **ans,
+                                              lens_rank=P.lens_rank(o, read_pos, cid)))
+            if (i + 1) % 10 == 0:
+                print(f"  [last2] jrandom 0.2: {i+1}/50 {time.time()-t0:.0f}s", flush=True)
+    json.dump(out, open(f"{NB}/last_two.json", "w"))
+    nbvol.commit()
+    print("[last2] DONE", flush=True)
+
+
+@app.function(image=image, gpu="L4", volumes={MOUNT: weights, NB: nbvol}, timeout=3 * 3600)
+def patch_sweep():
+    """Activation patching: is the answer-slot residual causally sufficient for the name,
+    and how far upstream does sufficiency hold?
+
+    SOURCE  = injected run (v_c at blocks 12-14, gamma 0.4), prefill "INJECTED: yes\\nCONCEPT:"
+    TARGET  = clean run, same passage and prefill (positions align exactly)
+    PATCH   = overwrite the target's residual at one (layer, position) with the source's
+
+    Layer indexing follows the lens convention used everywhere else: "patch at layer l"
+    replaces hidden_states[l+1], the output of block l, via a pre-hook on block l+1.
+    For l = 34 (no block 35) the hook sits on the final norm.
+
+    Positions: answer slot (last token), summary token (last user-turn token), and the
+    whole assistant span (<|im_end|> through the answer slot) as a block.
+    Controls: clean->clean patch (must do nothing); trials whose source did NOT name c.
+    """
+    import json, time
+    import torch
+    P = Pipeline(BASE_A, LENS, ELICIT2)
+    model = P.model
+    LAYERS = [12, 14, 16, 18, 20, 22, 23, 24, 25, 26, 28, 30, 32, 34]
+    PREFILL = "INJECTED: yes\nCONCEPT:"
+
+    # -- a pre-hook that overwrites given positions of block (l+1)'s input -----------
+    class Patch:
+        def __init__(self):
+            self.src = None; self.pos = None; self.handles = []
+        def install(self, l, src_h, pos):
+            self.remove()
+            self.src, self.pos = src_h, pos
+            def hook(mod, args):
+                h = args[0].clone()
+                h[:, self.pos, :] = self.src[self.pos, :].to(h.dtype)
+                return (h,) + args[1:]
+            def norm_hook(mod, args):
+                h = args[0].clone()
+                h[:, self.pos, :] = self.src[self.pos, :].to(h.dtype)
+                return (h,)
+            if l + 1 < len(model.model.layers):
+                self.handles.append(model.model.layers[l + 1].register_forward_pre_hook(hook))
+            else:
+                self.handles.append(model.model.norm.register_forward_pre_hook(norm_hook))
+        def remove(self):
+            for hd in self.handles: hd.remove()
+            self.handles = []
+    patch = Patch()
+
+    def rank_of(logits, cid):
+        return (logits > logits[cid]).sum().item()
+
+    rows, t0 = [], time.time()
+    with torch.no_grad():
+        for i, name in enumerate(P.CONCEPTS):
+            cid = P.CID[name]
+            for pi in range(10):
+                ids, span, read_pos = P.build_trial(PASSAGES[pi], PREFILL)
+                T = ids.shape[1]
+                seq = ids[0].tolist()
+                im_end = seq.index(P.IM_END)
+                pos_answer = [T - 1]
+                pos_summary = [read_pos]
+                pos_block = list(range(im_end, T))
+
+                # SOURCE: injected, keep every layer's residual
+                P.clear_hooks(); P.inject(cid, 0.4, span)
+                o_src = model(input_ids=ids, output_hidden_states=True)
+                P.clear_hooks()
+                hs_src = [h[0].float().cpu() for h in o_src.hidden_states]
+                rank_src = rank_of(o_src.logits[0, -1].float(), cid)
+
+                # TARGET clean baseline
+                o_cln = model(input_ids=ids, output_hidden_states=True)
+                hs_cln = [h[0].float().cpu() for h in o_cln.hidden_states]
+                rank_cln = rank_of(o_cln.logits[0, -1].float(), cid)
+
+                res = dict(concept=name, category=P.CAT[name], passage=pi,
+                           rank_src=rank_src, rank_clean=rank_cln, named_src=rank_src < 5,
+                           answer={}, summary={}, block={}, ctrl_clean_to_clean={})
+                for l in LAYERS:
+                    src_h = hs_src[l + 1].to(model.device)
+                    for key, pos in (("answer", pos_answer), ("summary", pos_summary), ("block", pos_block)):
+                        patch.install(l, src_h, pos)
+                        lg = model(input_ids=ids).logits[0, -1].float()
+                        patch.remove()
+                        res[key][str(l)] = rank_of(lg, cid)
+                    if l in (24,):   # clean->clean control at the key layer, answer slot
+                        patch.install(l, hs_cln[l + 1].to(model.device), pos_answer)
+                        lg = model(input_ids=ids).logits[0, -1].float()
+                        patch.remove()
+                        res["ctrl_clean_to_clean"][str(l)] = rank_of(lg, cid)
+                rows.append(res)
+            print(f"  [patch] {i+1:2d}/50 {name:10s}  named_src so far "
+                  f"{sum(r['named_src'] for r in rows)}/{len(rows)}  {time.time()-t0:5.0f}s", flush=True)
+            if (i + 1) % 5 == 0:
+                with open(f"{NB}/patch_sweep.jsonl", "w") as f:
+                    for r in rows: f.write(json.dumps(r) + "\n")
+                nbvol.commit()
+    with open(f"{NB}/patch_sweep.jsonl", "w") as f:
+        for r in rows: f.write(json.dumps(r) + "\n")
+    nbvol.commit()
+    print(f"[patch] DONE {len(rows)} trials", flush=True)
+
+
+@app.function(image=image, gpu="L4", volumes={MOUNT: weights, NB: nbvol}, timeout=3 * 3600)
+def necessity_sweep():
+    """The complement of patch_sweep: NECESSITY rather than sufficiency.
+
+    Sufficiency asked: does the source's residual at (l, answer slot), dropped into a
+    clean run, produce the name?  It did not until layer ~32.
+    Necessity asks: in the SOURCE run itself, if we overwrite the answer-slot residual
+    at layer l with the CLEAN run's value (the reverse patch), does the name go away?
+    A position can be necessary without being sufficient: the concept may be assembled
+    from that residual plus continued attention to the injected user tokens.
+
+    Also tests the user-turn span as a block (overwrite ALL injected user positions at
+    layer l with clean values): if naming dies, late layers are still reading the
+    injection from the user turn, which is the 'reinforcement' hypothesis.
+    """
+    import json, time
+    import torch
+    P = Pipeline(BASE_A, LENS, ELICIT2)
+    model = P.model
+    LAYERS = [16, 20, 22, 23, 24, 25, 26, 28, 30, 32]
+    PREFILL = "INJECTED: yes\nCONCEPT:"
+
+    class Patch:
+        def __init__(self): self.handles = []
+        def install(self, l, src_h, pos):
+            self.remove()
+            def hook(mod, args):
+                h = args[0].clone(); h[:, pos, :] = src_h[pos, :].to(h.dtype); return (h,) + args[1:]
+            def norm_hook(mod, args):
+                h = args[0].clone(); h[:, pos, :] = src_h[pos, :].to(h.dtype); return (h,)
+            if l + 1 < len(model.model.layers):
+                self.handles.append(model.model.layers[l + 1].register_forward_pre_hook(hook))
+            else:
+                self.handles.append(model.model.norm.register_forward_pre_hook(norm_hook))
+        def remove(self):
+            for hd in self.handles: hd.remove()
+            self.handles = []
+    patch = Patch()
+    rank_of = lambda lg, cid: (lg > lg[cid]).sum().item()
+
+    rows, t0 = [], time.time()
+    with torch.no_grad():
+        for i, name in enumerate(P.CONCEPTS):
+            cid = P.CID[name]
+            for pi in range(10):
+                ids, span, read_pos = P.build_trial(PASSAGES[pi], PREFILL)
+                T = ids.shape[1]
+                pos_answer = [T - 1]
+                pos_user = list(range(span.start, span.stop))
+
+                # clean residuals (what we will overwrite WITH)
+                o_cln = model(input_ids=ids, output_hidden_states=True)
+                hs_cln = [h[0].float() for h in o_cln.hidden_states]
+
+                # source rank, no ablation
+                P.clear_hooks(); P.inject(cid, 0.4, span)
+                rank_src = rank_of(model(input_ids=ids).logits[0, -1].float(), cid)
+                P.clear_hooks()
+
+                res = dict(concept=name, category=P.CAT[name], passage=pi,
+                           rank_src=rank_src, named_src=rank_src < 5,
+                           ablate_answer={}, ablate_user_span={})
+                for l in LAYERS:
+                    for key, pos in (("ablate_answer", pos_answer), ("ablate_user_span", pos_user)):
+                        # injection hooks on blocks 12-14 AND the reverse patch on block l+1
+                        P.clear_hooks(); P.inject(cid, 0.4, span)
+                        patch.install(l, hs_cln[l + 1], pos)
+                        lg = model(input_ids=ids).logits[0, -1].float()
+                        patch.remove(); P.clear_hooks()
+                        res[key][str(l)] = rank_of(lg, cid)
+                rows.append(res)
+            print(f"  [nec] {i+1:2d}/50 {name:10s} named_src {sum(r['named_src'] for r in rows)}/{len(rows)} {time.time()-t0:5.0f}s", flush=True)
+            if (i + 1) % 5 == 0:
+                with open(f"{NB}/necessity_sweep.jsonl", "w") as f:
+                    for r in rows: f.write(json.dumps(r) + "\n")
+                nbvol.commit()
+    with open(f"{NB}/necessity_sweep.jsonl", "w") as f:
+        for r in rows: f.write(json.dumps(r) + "\n")
+    nbvol.commit()
+    print(f"[nec] DONE {len(rows)}", flush=True)
