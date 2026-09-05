@@ -822,3 +822,202 @@ def necessity_sweep():
         for r in rows: f.write(json.dumps(r) + "\n")
     nbvol.commit()
     print(f"[nec] DONE {len(rows)}", flush=True)
+
+
+@app.function(image=image, gpu="L4", volumes={MOUNT: weights, NB: nbvol}, timeout=2 * 3600)
+def rank_one_pilot():
+    """Content-necessity, not position-necessity.
+
+    Full-residual replacement at the answer slot kills naming 94-100% from L23, but that
+    deletes the whole position: concept and answer-formation state together. Here we
+    remove ONLY the concept's lens direction, rank-one, and leave the rest intact.
+
+    At lens layer l (hidden_states[l+1], pre-hook on block l+1), answer slot, in the
+    injected run:
+      full      h <- h_clean                                   (reference, as before)
+      proj0     h <- h - <h, v> v                              (project v_c out to zero)
+      projclean h <- h - (<h, v> - <h_clean, v>) v             (set projection to clean value)
+      projrand  h <- h - <h, u> u,  u = random J-space dir     (null: a different direction)
+    where v = unit lens direction J_l^T (g * W_U[c]) at that layer.
+    Records rank of c and log P(c) at the CONCEPT slot after each, so the importance
+    label (delta log-prob) can be read off directly.
+    """
+    import json, random, time
+    import torch
+    P = Pipeline(BASE_A, LENS, ELICIT2)
+    model = P.model
+    LAYERS = [22, 23, 24, 26]
+    PREFILL = "INJECTED: yes\nCONCEPT:"
+    battery = set(P.CID.values())
+
+    def lens_dir(cid, l):
+        v = P.J[l].float().T @ (P.G.float() * P.W_U[cid].float()); return v / v.norm()
+
+    def rand_dir(seed, l):
+        rng = random.Random(seed)
+        while True:
+            t = rng.randrange(2000, 150000); s = P.tok.decode([t])
+            if t not in battery and s.startswith(" ") and s.strip().isalpha() and len(s.strip()) > 2:
+                return lens_dir(t, l)
+
+    class Edit:
+        def __init__(self): self.h = []
+        def install(self, l, fn):
+            self.remove()
+            def hook(mod, args):
+                h = args[0].clone(); h[:, -1, :] = fn(h[:, -1, :].float()).to(h.dtype); return (h,) + args[1:]
+            self.h.append(model.model.layers[l + 1].register_forward_pre_hook(hook))
+        def remove(self):
+            for x in self.h: x.remove()
+            self.h = []
+    ed = Edit()
+
+    def score(lg, cid):
+        lp = torch.log_softmax(lg, -1)
+        return (lg > lg[cid]).sum().item(), lp[cid].item()
+
+    rows, t0 = [], time.time()
+    with torch.no_grad():
+        for i, name in enumerate(P.CONCEPTS):
+            cid = P.CID[name]
+            for pi in range(10):
+                ids, span, _ = P.build_trial(PASSAGES[pi], PREFILL)
+                o_c = model(input_ids=ids, output_hidden_states=True)
+                hs_c = {l: o_c.hidden_states[l + 1][0, -1].float() for l in LAYERS}
+                P.clear_hooks(); P.inject(cid, 0.4, span)
+                o_s = model(input_ids=ids, output_hidden_states=True)
+                hs_s = {l: o_s.hidden_states[l + 1][0, -1].float() for l in LAYERS}
+                P.clear_hooks()
+                r_src, lp_src = score(o_s.logits[0, -1].float(), cid)
+                res = dict(concept=name, category=P.CAT[name], passage=pi,
+                           rank_src=r_src, logp_src=lp_src, named_src=r_src < 5, layers={})
+                for l in LAYERS:
+                    v = lens_dir(cid, l); u = rand_dir(i * 1000 + pi, l)
+                    hc = hs_c[l]; proj_c = torch.dot(hc, v).item(); proj_s = torch.dot(hs_s[l], v).item()
+                    edits = {
+                        "full":      lambda h: hc.unsqueeze(0).expand_as(h),
+                        "proj0":     lambda h: h - (h @ v).unsqueeze(-1) * v,
+                        "projclean": lambda h: h - ((h @ v) - proj_c).unsqueeze(-1) * v,
+                        "projrand":  lambda h: h - (h @ u).unsqueeze(-1) * u,
+                    }
+                    out = {"proj_src": proj_s, "proj_clean": proj_c}
+                    for k, fn in edits.items():
+                        P.clear_hooks(); P.inject(cid, 0.4, span); ed.install(l, fn)
+                        r, lp = score(model(input_ids=ids).logits[0, -1].float(), cid)
+                        ed.remove(); P.clear_hooks()
+                        out[k] = {"rank": r, "logp": lp}
+                    res["layers"][str(l)] = out
+                rows.append(res)
+            print(f"  [r1] {i+1:2d}/50 {name:10s} named {sum(r['named_src'] for r in rows)}/{len(rows)} {time.time()-t0:5.0f}s", flush=True)
+            if (i + 1) % 10 == 0:
+                with open(f"{NB}/rank_one_pilot.jsonl", "w") as f:
+                    for r in rows: f.write(json.dumps(r) + "\n")
+                nbvol.commit()
+    with open(f"{NB}/rank_one_pilot.jsonl", "w") as f:
+        for r in rows: f.write(json.dumps(r) + "\n")
+    nbvol.commit()
+    print(f"[r1] DONE {len(rows)}", flush=True)
+
+
+# ---- Natural-presence prompt pool ------------------------------------------------------
+# One two-hop description per concept: implies the concept, never names it, and avoids
+# naming any OTHER battery concept. Drafted with Claude; the filter below decides which
+# survive (concept readable at the answer slot, L23, with no injection).
+NATURAL = {
+    "France": "The republic whose capital lies on the Seine and whose revolution began in 1789.",
+    "Japan": "The island nation whose capital is Tokyo and whose currency is the yen.",
+    "Brazil": "The largest country in South America, whose official language is Portuguese.",
+    "Egypt": "The country of the Nile, the pyramids at Giza, and the city of Cairo.",
+    "Canada": "The country directly north of the United States whose capital is Ottawa.",
+    "Germany": "The central European country whose capital is Berlin and whose currency was the mark.",
+    "Norway": "The Scandinavian kingdom of fjords whose capital is Oslo.",
+    "Chile": "The long narrow country along the Pacific coast of South America, capital Santiago.",
+    "Poland": "The central European country whose capital is Warsaw, on the Vistula.",
+    "Nepal": "The Himalayan country whose capital is Kathmandu, on the south side of Everest.",
+    "spider": "The eight-legged creature that spins silk webs to trap flying insects.",
+    "elephant": "The largest land animal, with a trunk, tusks, and large flapping ears.",
+    "tiger": "The largest of the big cats, striped, native to the forests of Asia.",
+    "whale": "The largest animal that has ever lived, a marine mammal that breathes through a blowhole.",
+    "rabbit": "The long-eared burrowing mammal that hops and is often kept as a pet.",
+    "snake": "The legless reptile that slithers and sheds its skin, some species venomous.",
+    "eagle": "The large bird of prey with a hooked beak that appears on the United States seal.",
+    "camel": "The humped desert animal used for transport across the Sahara.",
+    "frog": "The amphibian that begins life as a tadpole and catches insects with its tongue.",
+    "owl": "The nocturnal bird of prey that hoots and can turn its head almost all the way round.",
+    "bread": "The staple baked from flour, water, and yeast, sliced for sandwiches.",
+    "cheese": "The dairy product made by curdling milk, aged in wheels and served on a board with crackers.",
+    "pasta": "The Italian staple made from durum wheat, boiled and served with sauce.",
+    "soup": "The liquid dish of stock and vegetables, served hot in a bowl with a spoon.",
+    "chocolate": "The sweet made from roasted cacao beans, sold in bars and melted for cakes.",
+    "honey": "The sweet substance that bees make from nectar and store in wax combs.",
+    "butter": "The dairy fat churned from cream, spread on toast and used in baking.",
+    "garlic": "The pungent bulb of cloves crushed into sauces and said to repel vampires.",
+    "noodles": "The long thin strands of dough boiled and served in Asian broths and stir-fries.",
+    "mango": "The tropical stone fruit with sweet fibrous flesh, eaten ripe or pickled green in South Asia.",
+    "purple": "The colour of amethyst and of royal robes, between red and blue on the spectrum.",
+    "yellow": "The colour of lemons, ripe bananas, and the centre of a daisy.",
+    "pink": "The pale colour of flamingos, cherry blossom, and cooked salmon.",
+    "brown": "The colour of soil, tree bark, and roasted coffee beans.",
+    "grey": "The colour of ash, overcast skies, and unpainted concrete.",
+    "violet": "The colour at the shortest visible wavelength, just past indigo, named for a small flower.",
+    "beige": "The pale sandy colour of unbleached wool and neutral office walls.",
+    "teal": "The dark blue-green colour named after the stripe on a small duck.",
+    "navy": "The very dark blue of naval uniforms and formal blazers.",
+    "crimson": "The deep red of arterial blood and Harvard's official colour.",
+    "anger": "The hot emotion of being wronged, with clenched fists and a raised voice.",
+    "sadness": "The low emotion after a loss, with tears and a heavy quiet.",
+    "guilt": "The gnawing feeling of having done something wrong to another person.",
+    "shame": "The feeling of wanting to hide after being exposed as inadequate.",
+    "disgust": "The recoiling feeling at something rotten, with a wrinkled nose.",
+    "envy": "The bitter wish to have what another person has.",
+    "grief": "The long sorrow that follows the death of someone loved.",
+    "boredom": "The restless dullness of having nothing engaging to do for hours.",
+    "dread": "The sinking anticipation of something bad that is certain to come.",
+    "despair": "The complete loss of hope that anything will get better.",
+}
+ELICIT_CONTENT = (
+    "\n\nAbove is a short passage. Introspect on what you are representing as you read it.\n"
+    "Answer on exactly two lines. The first line is PRESENT: followed by yes or no, saying "
+    "whether a single specific concept stands out. The second line is CONCEPT: followed by "
+    "a single lowercase noun naming it, or none."
+)
+
+
+@app.function(image=image, gpu="L4", volumes={MOUNT: weights, NB: nbvol}, timeout=3600)
+def natural_filter():
+    """Which natural-presence prompts put their concept at the answer slot, L23, unaided?
+    Two wordings: Phase 1's injection elicitation (for comparability) and a content
+    question (what Phase 2 will actually ask). No injection anywhere. Also records every
+    other battery concept's rank so leaks are visible."""
+    import json
+    import torch
+    P = Pipeline(BASE_A, LENS, ELICIT2)
+    rows = []
+    with torch.no_grad():
+        for name, passage in NATURAL.items():
+            cid = P.CID[name]
+            for wording, elicit, prefill in (("injection", ELICIT2, "INJECTED: yes\nCONCEPT:"),
+                                             ("content", ELICIT_CONTENT, "PRESENT: yes\nCONCEPT:")):
+                P.elicit = elicit
+                ids, span, read_pos = P.build_trial(passage, prefill)
+                o = P.model(input_ids=ids, output_hidden_states=True)
+                lg = o.logits[0, -1].float()
+                def lens_at(l, pos):
+                    h = o.hidden_states[l + 1][0, pos].float()
+                    return (P.W_U @ P.NORM(P.J[l].float() @ h).to(P.W_U.dtype)).float()
+                l23 = lens_at(23, -1); l24 = lens_at(24, -1); u22 = lens_at(22, read_pos)
+                rk = lambda v, c: (v > v[c]).sum().item()
+                rows.append(dict(concept=name, category=P.CAT[name], wording=wording, passage=passage,
+                                 n_tokens=len(P.tok.encode(passage)),
+                                 lens_answer_L23=rk(l23, cid), lens_answer_L24=rk(l24, cid),
+                                 lens_user_L22=rk(u22, cid), rank_c=rk(lg, cid),
+                                 top5_slot=[P.tok.decode([k]) for k in lg.topk(5).indices.tolist()],
+                                 top5_lens23=[P.tok.decode([k]) for k in l23.topk(5).indices.tolist()],
+                                 other_battery_L23={w: rk(l23, c2) for w, c2 in P.CID.items() if w != name and rk(l23, c2) <= 25}))
+            print(f"  [nat] {name:10s} inj L23={rows[-2]['lens_answer_L23']:6d} slot={rows[-2]['rank_c']:5d} | "
+                  f"content L23={rows[-1]['lens_answer_L23']:6d} slot={rows[-1]['rank_c']:5d}", flush=True)
+    P.elicit = ELICIT2
+    with open(f"{NB}/natural_filter.jsonl", "w") as f:
+        for r in rows: f.write(json.dumps(r) + "\n")
+    nbvol.commit()
+    print(f"[nat] DONE {len(rows)}", flush=True)
