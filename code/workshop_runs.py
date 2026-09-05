@@ -21,7 +21,7 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("torch==2.9.0", "transformers>=4.51", "accelerate", "numpy",
                  "huggingface_hub[hf_transfer]")
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
     # Modal 1.x ships only the entrypoint file; natural_filter_v2 imports natural_pool.
     .add_local_python_source("natural_pool")
 )
@@ -135,6 +135,16 @@ class Pipeline:
         w = self.G.float() * self.W_U[c_id].float()
         v = self.J[source_layer].float().T @ w
         return v / v.norm()
+
+    def concept_dirs(self, layer):
+        """{concept: unit v_c} at one lens layer via a single fp16 matmul. Never copies J to fp32:
+        the per-concept fp32 version allocated a 64 MB temporary per call and OOM'd the L4
+        once more than one layer was requested."""
+        cids = list(self.CID.values())
+        w = (self.G.to(self.J[layer].dtype) * self.W_U[cids].to(self.J[layer].dtype))   # [50, d] fp16
+        V = (w @ self.J[layer]).float()                                                  # rows = J^T w
+        V = V / V.norm(dim=1, keepdim=True)
+        return dict(zip(self.CID.keys(), V))
 
     def random_vec(self, seed, layer):
         g = self.torch.Generator(device="cpu").manual_seed(seed * 100 + layer)
@@ -1247,7 +1257,8 @@ def labels_neutral_multi():
     P = Pipeline(BASE_A, LENS, ELICIT_CONTENT)
     model = P.model
     LAYERS = (24, 25, 26)
-    vdir = {l: {w: (lambda v: v / v.norm())(P.J[l].float().T @ (P.G.float() * P.W_U[c].float())) for w, c in P.CID.items()} for l in LAYERS}
+    vdir = {l: P.concept_dirs(l) for l in LAYERS}
+    torch.cuda.empty_cache()
     def lens_rank(h, l, cid):
         lg = P.W_U @ P.NORM(P.J[l].float() @ h).to(P.W_U.dtype); return (lg > lg[cid]).sum().item()
     rows, t0 = [], time.time()
@@ -1289,7 +1300,8 @@ def importance_pilot_2layer():
     sweep = [json.loads(l) for l in open(f"{NB}/natural_layer_sweep.jsonl")]
     from natural_pool import NATURAL_POOL
     present = [r for r in sweep if _two_layer_label(r["jlens"]["25"], r["jlens"]["26"]) == "present"]
-    vdir = {l: {w: (lambda v: v / v.norm())(P.J[l].float().T @ (P.G.float() * P.W_U[c].float())) for w, c in P.CID.items()} for l in NAT_LAYERS}
+    vdir = {l: P.concept_dirs(l) for l in NAT_LAYERS}
+    torch.cuda.empty_cache()
     # clean projections at L25/L26 from the 20 neutral passages
     cp = {l: {w: [] for w in P.CID} for l in NAT_LAYERS}
     with torch.no_grad():
@@ -1333,3 +1345,43 @@ def importance_pilot_2layer():
     for l in NAT_LAYERS:
         d = np.array([r[f"L{l}"]["dlogp"] for r in rows]); print(f"[imp2] L{l}: n={len(rows)} dlogp median {np.median(d):+.2f} sd {d.std():.2f}", flush=True)
     print(f"[imp2] DONE {len(rows)}", flush=True)
+
+
+@app.function(image=image, gpu="L4", volumes={MOUNT: weights, NB: nbvol}, timeout=3600)
+def natural_filter_r2():
+    """Filter the round-two descriptions (NATURAL_POOL_R2, thin concepts only) under the
+    two-layer rule: lens rank at L25 and L26, answer slot, neutral wording, no injection.
+    Same fields as natural_filter_v2 plus both layers and the two-layer label."""
+    import json, time
+    import torch
+    from natural_pool import NATURAL_POOL_R2
+    P = Pipeline(BASE_A, LENS, ELICIT_CONTENT)
+    model = P.model
+    vdir = {l: P.concept_dirs(l) for l in NAT_LAYERS}
+    torch.cuda.empty_cache()
+    rows, t0 = [], time.time()
+    with torch.no_grad():
+        for name, descs in NATURAL_POOL_R2.items():
+            cid = P.CID[name]
+            for di, passage in enumerate(descs):
+                ids, _, _ = P.build_trial(passage, "PRESENT: yes\nCONCEPT:")
+                o = model(input_ids=ids, output_hidden_states=True)
+                lg = o.logits[0, -1].float()
+                rk = lambda v, c: (v > v[c]).sum().item()
+                lens, proj = {}, {}
+                for l in NAT_LAYERS:
+                    h = o.hidden_states[l + 1][0, -1].float()
+                    v = (P.W_U @ P.NORM(P.J[l].float() @ h).to(P.W_U.dtype)).float()
+                    lens[str(l)] = rk(v, cid); proj[str(l)] = torch.dot(h, vdir[l][name]).item()
+                    if l == 26:
+                        leaks = {w: rk(v, c2) for w, c2 in P.CID.items() if w != name and rk(v, c2) <= 25}
+                rows.append(dict(concept=name, category=P.CAT[name], round=2, desc_idx=di, passage=passage,
+                                 n_tokens=len(P.tok.encode(passage)), lens=lens, proj_clean=proj,
+                                 rank_c=rk(lg, cid), label=_two_layer_label(lens["25"], lens["26"]),
+                                 top5_slot=[P.tok.decode([k]) for k in lg.topk(5).indices.tolist()], leaks=leaks))
+            n_pres = sum(r["label"] == "present" for r in rows if r["concept"] == name)
+            print(f"  [r2] {name:10s} present {n_pres}/{len(descs)}  named {sum(r['rank_c']<5 for r in rows if r['concept']==name)}/{len(descs)}  {time.time()-t0:4.0f}s", flush=True)
+    with open(f"{NB}/natural_pool_r2_labels.jsonl", "w") as f:
+        for r in rows: f.write(json.dumps(r) + "\n")
+    nbvol.commit()
+    print(f"[r2] DONE {len(rows)} present {sum(r['label']=='present' for r in rows)} absent {sum(r['label']=='absent' for r in rows)} discard {sum(r['label']=='discard' for r in rows)}", flush=True)
