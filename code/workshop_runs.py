@@ -1191,3 +1191,39 @@ def importance_pilot_natural():
     nbvol.commit()
     d = np.array([r["projclean"]["dlogp"] for r in rows]); nm = np.array([r["named_base"] for r in rows])
     print(f"[imp] DONE {len(rows)} present prompts; dlogp median {np.median(d):+.2f} sd {d.std():.2f}; named {nm.mean():.2f}", flush=True)
+
+
+@app.function(image=image, gpu="L4", volumes={MOUNT: weights, NB: nbvol}, timeout=3600)
+def natural_layer_sweep():
+    """Diagnostic for the natural-stratum margin. The scaled pool put only 58/300 prompts at
+    lens rank <= 100 at L24 while the model names the concept unaided on 127/300, and 43 of
+    the prompts labelled ABSENT (>= 1000) are named unaided. Is there a layer at the answer
+    slot, below the circular band, where natural presence is readable? Records the lens rank
+    of the target at layers 20..32, answer slot, neutral wording, no injection, plus the
+    logit lens at the same layers for comparison."""
+    import json, time
+    import torch
+    from natural_pool import NATURAL_POOL
+    P = Pipeline(BASE_A, LENS, ELICIT_CONTENT)
+    model = P.model
+    LAYERS = list(range(20, 33))
+    rows, t0 = [], time.time()
+    with torch.no_grad():
+        for name, descs in NATURAL_POOL.items():
+            cid = P.CID[name]
+            for di, passage in enumerate(descs):
+                ids, _, _ = P.build_trial(passage, "PRESENT: yes\nCONCEPT:")
+                o = model(input_ids=ids, output_hidden_states=True)
+                lg = o.logits[0, -1].float()
+                jl, ll = {}, {}
+                for l in LAYERS:
+                    h = o.hidden_states[l + 1][0, -1].float()
+                    v = P.W_U @ P.NORM(P.J[l].float() @ h).to(P.W_U.dtype)
+                    w = P.W_U @ P.NORM(h).to(P.W_U.dtype)
+                    jl[str(l)] = (v > v[cid]).sum().item(); ll[str(l)] = (w > w[cid]).sum().item()
+                rows.append(dict(concept=name, category=P.CAT[name], desc_idx=di,
+                                 rank_c=(lg > lg[cid]).sum().item(), jlens=jl, logitlens=ll))
+    with open(f"{NB}/natural_layer_sweep.jsonl", "w") as f:
+        for r in rows: f.write(json.dumps(r) + "\n")
+    nbvol.commit()
+    print(f"[nls] DONE {len(rows)} {time.time()-t0:.0f}s", flush=True)
