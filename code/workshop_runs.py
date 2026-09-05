@@ -22,6 +22,8 @@ image = (
     .pip_install("torch==2.9.0", "transformers>=4.51", "accelerate", "numpy",
                  "huggingface_hub[hf_transfer]")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    # Modal 1.x ships only the entrypoint file; natural_filter_v2 imports natural_pool.
+    .add_local_python_source("natural_pool")
 )
 
 # ---- identical to the notebook ---------------------------------------------
@@ -1021,3 +1023,171 @@ def natural_filter():
         for r in rows: f.write(json.dumps(r) + "\n")
     nbvol.commit()
     print(f"[nat] DONE {len(rows)}", flush=True)
+
+
+@app.function(image=image, gpu="L4", volumes={MOUNT: weights, NB: nbvol}, timeout=2 * 3600)
+def labels_neutral():
+    """Phase 2 label generation for the INJECTED stratum under the single neutral
+    elicitation (ELICIT_CONTENT), answer slot, lens layer 24. Also gamma 0 (absent
+    labels) and gamma 0.2 (the free dose-response prediction).
+
+    Per (concept, passage, gamma):
+      lens_L24         lens rank of c at answer slot, hidden_states[25], last position   <- the label
+      rank_c           rank of c in the CONCEPT slot                                     <- naming
+      p_present        forced choice yes/no after 'PRESENT:'
+      proj_src         <h_src, v_c>  at L24 answer slot
+      proj_clean       <h_clean, v_c> at L24 answer slot  (the covariate the mentor asked for)
+    Clean residuals are computed once per passage and reused across concepts.
+    """
+    import json, time
+    import torch
+    P = Pipeline(BASE_A, LENS, ELICIT_CONTENT)
+    model = P.model
+    L = 24
+    PRE_YN, PRE_C = "PRESENT:", "PRESENT: yes\nCONCEPT:"
+    vdir = {w: (lambda v: v / v.norm())(P.J[L].float().T @ (P.G.float() * P.W_U[c].float())) for w, c in P.CID.items()}
+
+    def lens_rank_at(h, cid):
+        lg = P.W_U @ P.NORM(P.J[L].float() @ h).to(P.W_U.dtype)
+        return (lg > lg[cid]).sum().item()
+
+    rows, t0 = [], time.time()
+    with torch.no_grad():
+        for pi, passage in enumerate(PASSAGES):
+            ids_c, span, _ = P.build_trial(passage, PRE_C)
+            ids_y, _, _ = P.build_trial(passage, PRE_YN)
+            o_cln = model(input_ids=ids_c, output_hidden_states=True)
+            h_cln = o_cln.hidden_states[L + 1][0, -1].float()
+            lg_cln_c = o_cln.logits[0, -1].float()
+            pr_cln_y = P.answer(model(input_ids=ids_y).logits[0, -1].float(), ("yes", "no"))
+            for name, cid in P.CID.items():
+                v = vdir[name]
+                # gamma 0: clean, shared forward passes
+                rows.append(dict(concept=name, category=P.CAT[name], passage=pi, gamma=0.0,
+                                 lens_L24=lens_rank_at(h_cln, cid), rank_c=(lg_cln_c > lg_cln_c[cid]).sum().item(),
+                                 p_present=pr_cln_y["p_yes"], mass=pr_cln_y["mass"],
+                                 proj_src=torch.dot(h_cln, v).item(), proj_clean=torch.dot(h_cln, v).item()))
+                for g in (0.2, 0.4):
+                    P.clear_hooks(); P.inject(cid, g, span)
+                    o = model(input_ids=ids_c, output_hidden_states=True)
+                    h = o.hidden_states[L + 1][0, -1].float(); lg = o.logits[0, -1].float()
+                    pr = P.answer(model(input_ids=ids_y).logits[0, -1].float(), ("yes", "no"))
+                    P.clear_hooks()
+                    rows.append(dict(concept=name, category=P.CAT[name], passage=pi, gamma=g,
+                                     lens_L24=lens_rank_at(h, cid), rank_c=(lg > lg[cid]).sum().item(),
+                                     p_present=pr["p_yes"], mass=pr["mass"],
+                                     proj_src=torch.dot(h, v).item(), proj_clean=torch.dot(h_cln, v).item()))
+            print(f"  [lab] passage {pi+1:2d}/20  {time.time()-t0:5.0f}s", flush=True)
+            with open(f"{NB}/labels_neutral.jsonl", "w") as f:
+                for r in rows: f.write(json.dumps(r) + "\n")
+            nbvol.commit()
+    print(f"[lab] DONE {len(rows)}", flush=True)
+
+
+# ===== Phase 2 natural stratum: scaled pool, neutral wording, L24, with covariate ============
+NAT_PRESENT, NAT_ABSENT = 100, 1000     # frozen natural-stratum margins
+INJ_PRESENT, INJ_ABSENT = 10, 500       # frozen injected-stratum margins
+
+
+@app.function(image=image, gpu="L4", volumes={MOUNT: weights, NB: nbvol}, timeout=2 * 3600)
+def natural_filter_v2():
+    """Filter the scaled natural pool (natural_pool.py, ~6 descriptions per concept) under the
+    single neutral elicitation, reading the label at the answer slot, L24. Records the clean
+    projection covariate and every other battery concept within rank 25 (leak check).
+    Output rows carry the frozen natural-stratum label: present / middle / absent."""
+    import json, time
+    import torch
+    from natural_pool import NATURAL_POOL
+    P = Pipeline(BASE_A, LENS, ELICIT_CONTENT)
+    model = P.model
+    L = 24
+    vdir = {w: (lambda v: v / v.norm())(P.J[L].float().T @ (P.G.float() * P.W_U[c].float())) for w, c in P.CID.items()}
+    rows, t0 = [], time.time()
+    with torch.no_grad():
+        for name, descs in NATURAL_POOL.items():
+            cid = P.CID[name]
+            for di, passage in enumerate(descs):
+                ids, span, _ = P.build_trial(passage, "PRESENT: yes\nCONCEPT:")
+                o = model(input_ids=ids, output_hidden_states=True)
+                h = o.hidden_states[L + 1][0, -1].float(); lg = o.logits[0, -1].float()
+                lens = (P.W_U @ P.NORM(P.J[L].float() @ h).to(P.W_U.dtype)).float()
+                rk = lambda v, c: (v > v[c]).sum().item()
+                r_lens = rk(lens, cid)
+                ids_y, _, _ = P.build_trial(passage, "PRESENT:")
+                pr = P.answer(model(input_ids=ids_y).logits[0, -1].float(), ("yes", "no"))
+                rows.append(dict(concept=name, category=P.CAT[name], desc_idx=di, passage=passage,
+                                 n_tokens=len(P.tok.encode(passage)),
+                                 lens_L24=r_lens, rank_c=rk(lg, cid), p_present=pr["p_yes"], mass=pr["mass"],
+                                 proj_clean=torch.dot(h, vdir[name]).item(),
+                                 label=("present" if r_lens <= NAT_PRESENT else "absent" if r_lens >= NAT_ABSENT else "middle"),
+                                 top5_slot=[P.tok.decode([k]) for k in lg.topk(5).indices.tolist()],
+                                 leaks={w: rk(lens, c2) for w, c2 in P.CID.items() if w != name and rk(lens, c2) <= 25}))
+            n_pres = sum(r["label"] == "present" for r in rows if r["concept"] == name)
+            print(f"  [nat2] {name:10s} present {n_pres}/{len(descs)}  {time.time()-t0:4.0f}s", flush=True)
+    with open(f"{NB}/natural_pool_labels.jsonl", "w") as f:
+        for r in rows: f.write(json.dumps(r) + "\n")
+    nbvol.commit()
+    print(f"[nat2] DONE {len(rows)}  present {sum(r['label']=='present' for r in rows)}  "
+          f"absent {sum(r['label']=='absent' for r in rows)}  middle {sum(r['label']=='middle' for r in rows)}", flush=True)
+
+
+@app.function(image=image, gpu="L4", volumes={MOUNT: weights, NB: nbvol}, timeout=2 * 3600)
+def importance_pilot_natural():
+    """Validation pilot for the importance rung (H5), on the NATURAL stratum only.
+    For every natural prompt labelled present (lens <= 100 at L24), apply the clean-value
+    rank-one ablation of v_c at the answer slot, L24, and record delta log P(c) and delta rank.
+    'Clean value' here is the projection of a matched neutral passage's residual, since a
+    natural prompt has no injected/clean pair: we use the median clean projection for that
+    concept over the 20 Phase 1 passages (from labels_neutral.jsonl), and also report the
+    project-to-zero variant. The rung survives only if delta log P(c) has real variance across
+    prompts and AUC against naming is well above 0.5."""
+    import json, time
+    import numpy as np
+    import torch
+    P = Pipeline(BASE_A, LENS, ELICIT_CONTENT)
+    model = P.model
+    L = 24
+    pool = [json.loads(l) for l in open(f"{NB}/natural_pool_labels.jsonl")]
+    present = [r for r in pool if r["label"] == "present"]
+    lab = [json.loads(l) for l in open(f"{NB}/labels_neutral.jsonl")]
+    clean_proj = {}
+    for w in P.CID:
+        xs = [r["proj_clean"] for r in lab if r["concept"] == w and r["gamma"] == 0.0]
+        clean_proj[w] = float(np.median(xs)) if xs else 0.0
+    vdir = {w: (lambda v: v / v.norm())(P.J[L].float().T @ (P.G.float() * P.W_U[c].float())) for w, c in P.CID.items()}
+
+    class Edit:
+        def __init__(self): self.h = []
+        def install(self, fn):
+            self.remove()
+            def hook(mod, args):
+                x = args[0].clone(); x[:, -1, :] = fn(x[:, -1, :].float()).to(x.dtype); return (x,) + args[1:]
+            self.h.append(model.model.layers[L + 1].register_forward_pre_hook(hook))
+        def remove(self):
+            for k in self.h: k.remove()
+            self.h = []
+    ed = Edit()
+    def score(lg, cid):
+        return (lg > lg[cid]).sum().item(), torch.log_softmax(lg, -1)[cid].item()
+
+    rows, t0 = [], time.time()
+    with torch.no_grad():
+        for i, r in enumerate(present):
+            name, cid, v = r["concept"], P.CID[r["concept"]], vdir[r["concept"]]
+            pc = clean_proj[name]
+            ids, _, _ = P.build_trial(r["passage"], "PRESENT: yes\nCONCEPT:")
+            r0, lp0 = score(model(input_ids=ids).logits[0, -1].float(), cid)
+            out = dict(concept=name, category=r["category"], desc_idx=r["desc_idx"], lens_L24=r["lens_L24"],
+                       rank_base=r0, logp_base=lp0, named_base=r0 < 5, clean_proj_used=pc, proj_natural=r["proj_clean"])
+            for key, fn in (("projclean", lambda h: h - ((h @ v) - pc).unsqueeze(-1) * v),
+                            ("proj0", lambda h: h - (h @ v).unsqueeze(-1) * v)):
+                ed.install(fn); rk, lp = score(model(input_ids=ids).logits[0, -1].float(), cid); ed.remove()
+                out[key] = {"rank": rk, "logp": lp, "dlogp": lp - lp0}
+            rows.append(out)
+            if (i + 1) % 25 == 0:
+                print(f"  [imp] {i+1}/{len(present)}  {time.time()-t0:4.0f}s", flush=True)
+    with open(f"{NB}/importance_natural.jsonl", "w") as f:
+        for r in rows: f.write(json.dumps(r) + "\n")
+    nbvol.commit()
+    d = np.array([r["projclean"]["dlogp"] for r in rows]); nm = np.array([r["named_base"] for r in rows])
+    print(f"[imp] DONE {len(rows)} present prompts; dlogp median {np.median(d):+.2f} sd {d.std():.2f}; named {nm.mean():.2f}", flush=True)
